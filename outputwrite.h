@@ -11,6 +11,7 @@
 
 //#pragma once
 #include <driver/gpio.h>
+#include "esp_idf_version.h"   // ESP_IDF_VERSION / ESP_IDF_VERSION_VAL used below
 
 #ifdef __cplusplus
 extern "C" {

@@ -1,6 +1,6 @@
 /*
  led_indicator — non-blocking single-LED status indicator (LEDC PWM)
- Version: 1.0.0  (created 2026-06-19)
+ Version: 1.4.0  (updated 2026-06-29)
  Created by Aram Vartanyan, (C) 2026
  */
 
@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define LED_INDICATOR_VERSION "1.0.0"
+#define LED_INDICATOR_VERSION "1.4.0"
 
 /* Configuration passed at init. Nothing is read from Kconfig inside the
    library — each project supplies its own pins/options, so the module stays
@@ -47,6 +47,13 @@ void ledBreathe(bool on);
    (independent of the steady base). on=false returns to the steady base.
    periodMs=0 -> 500 ms. */
 void ledBlink(bool on, uint16_t periodMs);
+
+/* Continuous "alive" heartbeat: a short pulse (80 ms) every 2 s, until turned
+   off. The pulse is the OPPOSITE of the steady base, so one heartbeat works
+   both ways: base off -> dark with a bright pulse; base on -> lit with a dark
+   pulse. Set the base with ledSteady() before enabling. on=false returns to
+   the steady base. */
+void ledHeartbeat(bool on);
 
 /* ---- transient effects (overlay the background, then return) ---- */
 

@@ -1,6 +1,6 @@
 /*
  led_indicator — non-blocking single-LED status indicator (LEDC PWM)
- Version: 1.0.0  (created 2026-06-19)
+ Version: 1.3.0  (updated 2026-06-28)
  Created by Aram Vartanyan, (C) 2026
  */
 
@@ -9,7 +9,6 @@
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 
@@ -26,6 +25,9 @@ static const char *TAG = "led_ind";
 #define BREATHE_PERIOD_MS  2500
 #define BREATHE_STEPS      (BREATHE_PERIOD_MS / BREATHE_TICK_MS)  /* 100 */
 #define BREATHE_HALF       (BREATHE_STEPS / 2)                    /* 50  */
+
+#define HEARTBEAT_ON_MS    80     /* "alive" pulse width */
+#define HEARTBEAT_OFF_MS   1920   /* gap; 80 + 1920 = 2 s period */
 
 /* ---- fixed patterns for the convenience wrappers (unified vocabulary) ---- */
 #define TX_BLINKS          1
@@ -47,7 +49,7 @@ static const char *TAG = "led_ind";
 #define RESET_MS           80
 
 /* persistent background mode */
-enum { BG_STEADY = 0, BG_BREATHE = 1, BG_BLINK = 2 };
+enum { BG_STEADY = 0, BG_BREATHE = 1, BG_BLINK = 2, BG_HEARTBEAT = 3 };
 /* transient effect (overlays the background) */
 enum { FX_NONE = 0, FX_FLASH = 1 };
 /* flash sub-phase */
@@ -57,7 +59,6 @@ static LedConfig s_cfg;
 static uint32_t  s_on_duty = LED_MAX_DUTY;   /* duty for "on" (scaled by onPercent) */
 static bool      s_inited  = false;
 
-static SemaphoreHandle_t s_lock  = NULL;
 static TimerHandle_t     s_timer = NULL;
 
 static bool s_base_on = false;     /* steady level requested by the app */
@@ -109,18 +110,21 @@ static void run_background(void)
     } else if (s_bg == BG_BLINK) {
         apply_duty(s_blink_on ? s_on_duty : 0);
         rearm(s_blink_period);
+    } else if (s_bg == BG_HEARTBEAT) {
+        /* pulse = opposite of the steady base (works from off AND from on) */
+        if (s_blink_on) apply_opposite(); else apply_base();
+        rearm(s_blink_on ? HEARTBEAT_ON_MS : HEARTBEAT_OFF_MS);
     } else {
         apply_base();
         stop_timer();
     }
 }
 
-/* Timer callback — runs in the Timer Service task. Only light LEDC register
-   writes happen here (no heavy calls), so the small timer-task stack is safe. */
+/* Timer callback — runs in the FreeRTOS timer-service task and is the sole
+   owner of the state machine. Only light LEDC register writes happen here. */
 static void led_timer_cb(TimerHandle_t t)
 {
     (void)t;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
 
     if (s_fx == FX_FLASH) {
         if (s_phase == PH_OPP) {                 /* opposite half done -> base half */
@@ -164,12 +168,14 @@ static void led_timer_cb(TimerHandle_t t)
         s_blink_on = !s_blink_on;
         apply_duty(s_blink_on ? s_on_duty : 0);
         rearm(s_blink_period);
+    } else if (s_bg == BG_HEARTBEAT) {           /* asymmetric: short pulse, long gap */
+        s_blink_on = !s_blink_on;
+        if (s_blink_on) apply_opposite(); else apply_base();   /* pulse = opposite of base */
+        rearm(s_blink_on ? HEARTBEAT_ON_MS : HEARTBEAT_OFF_MS);
     } else {                                     /* nothing dynamic -> settle and stop */
         apply_base();
         stop_timer();
     }
-
-    xSemaphoreGive(s_lock);
 }
 
 /* set up a (possibly grouped) flash; a continuous background suppresses it */
@@ -177,9 +183,7 @@ static void start_flash(uint8_t groups, uint8_t blinks, uint16_t periodMs, uint1
 {
     if (!s_inited || groups == 0 || blinks == 0) return;
     if (periodMs == 0) periodMs = DEFAULT_PERIOD_MS;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
     if (s_bg != BG_STEADY) {            /* breathe/blink have priority -> ignore flashes */
-        xSemaphoreGive(s_lock);
         return;
     }
     s_fx             = FX_FLASH;
@@ -191,7 +195,6 @@ static void start_flash(uint8_t groups, uint8_t blinks, uint16_t periodMs, uint1
     s_phase          = PH_OPP;
     apply_opposite();                  /* first (opposite) half */
     rearm(periodMs);
-    xSemaphoreGive(s_lock);
 }
 
 /* ---- public API ---- */
@@ -225,9 +228,8 @@ esp_err_t ledInit(const LedConfig *cfg)
     err = ledc_channel_config(&ccfg);
     if (err != ESP_OK) { ESP_LOGE(TAG, "ledc_channel_config failed: %d", err); return err; }
 
-    s_lock  = xSemaphoreCreateMutex();
     s_timer = xTimerCreate("led", pdMS_TO_TICKS(BREATHE_TICK_MS), pdFALSE, NULL, led_timer_cb);
-    if (!s_lock || !s_timer) { ESP_LOGE(TAG, "alloc failed"); return ESP_ERR_NO_MEM; }
+    if (!s_timer) { ESP_LOGE(TAG, "alloc failed"); return ESP_ERR_NO_MEM; }
 
     s_base_on = false;
     s_bg = BG_STEADY;
@@ -242,18 +244,15 @@ esp_err_t ledInit(const LedConfig *cfg)
 void ledSteady(bool on)
 {
     if (!s_inited) return;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
     s_base_on = on;
     if (s_fx == FX_NONE && s_bg == BG_STEADY) {
         apply_base();                    /* immediate when idle */
     }
-    xSemaphoreGive(s_lock);
 }
 
 void ledBreathe(bool on)
 {
     if (!s_inited) return;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
     if (on) {
         s_bg = BG_BREATHE;
         s_breathe_i = 0;
@@ -262,14 +261,12 @@ void ledBreathe(bool on)
         s_bg = BG_STEADY;
         if (s_fx == FX_NONE) { apply_base(); stop_timer(); }
     }
-    xSemaphoreGive(s_lock);
 }
 
 void ledBlink(bool on, uint16_t periodMs)
 {
     if (!s_inited) return;
     if (periodMs == 0) periodMs = DEFAULT_BLINK_MS;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
     if (on) {
         s_bg = BG_BLINK;
         s_blink_period = periodMs;
@@ -279,7 +276,19 @@ void ledBlink(bool on, uint16_t periodMs)
         s_bg = BG_STEADY;
         if (s_fx == FX_NONE) { apply_base(); stop_timer(); }
     }
-    xSemaphoreGive(s_lock);
+}
+
+void ledHeartbeat(bool on)
+{
+    if (!s_inited) return;
+    if (on) {
+        s_bg = BG_HEARTBEAT;
+        s_blink_on = true;               /* start with the pulse for immediate feedback */
+        if (s_fx == FX_NONE) { apply_opposite(); rearm(HEARTBEAT_ON_MS); }
+    } else {
+        s_bg = BG_STEADY;
+        if (s_fx == FX_NONE) { apply_base(); stop_timer(); }
+    }
 }
 
 void ledFlash(uint8_t times, uint16_t periodMs)
@@ -298,11 +307,9 @@ void ledFlashBlocking(uint8_t times, uint16_t periodMs)
     if (periodMs == 0) periodMs = DEFAULT_PERIOD_MS;
     /* Stop the engine: the device typically reboots right after, so drive the
        pattern synchronously instead of relying on the (soon-gone) timer. */
-    xSemaphoreTake(s_lock, portMAX_DELAY);
     s_fx = FX_NONE;
     stop_timer();
     bool base = s_base_on;
-    xSemaphoreGive(s_lock);
 
     for (uint8_t i = 0; i < times; i++) {
         apply_duty(base ? 0 : s_on_duty);          /* opposite of base */

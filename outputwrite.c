@@ -12,7 +12,7 @@
 const static char *TAG = "InputOutput";
 
 //https://docs.espressif.com/projects/esp-idf/en/v5.2.1/esp32/api-reference/peripherals/gpio.html
-//Може да се направи по друг начин. Едното инициализиране да е за входове, а другото за изходи. Така ще се поддържат всички функции.
+//Could be done differently: one init for inputs and another for outputs, so all functions are supported.
 
 esp_err_t ioInit(gpio_num_t keyPinNumber, bool isOutput, bool isPullUp) {
     
