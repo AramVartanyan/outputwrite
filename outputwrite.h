@@ -1,13 +1,13 @@
 /*
- MFi: 518311
- Brand: APRIMS
- Project: Relayt
- 
+ outputwrite — GPIO / Relay / ADC HAL helpers
+ Version: 1.1.0  (updated 2026-06-22)
  Created by Aram Vartanyan, (C) 2024
  */
 
 #ifndef _OUTPUTWRITE_H_
 #define _OUTPUTWRITE_H_
+
+#define OUTPUTWRITE_VERSION "1.1.0"
 
 //#pragma once
 #include <driver/gpio.h>

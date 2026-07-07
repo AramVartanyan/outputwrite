@@ -1,8 +1,6 @@
 /*
- MFi: 518311
- Brand: APRIMS
- Project: Relayt
- 
+ outputwrite — GPIO / Relay / ADC HAL helpers
+ Version: 1.1.0  (updated 2026-06-22)
  Created by Aram Vartanyan, (C) 2024
  */
 
@@ -88,11 +86,11 @@ bool adcCalibrationInit(adc_unit_t Unit, adc_channel_t Channel, adc_atten_t Atte
     bool isCalibrated = false;
     
     //ADC1 Init
-    adc_oneshot_unit_handle_t adcUnitHandle;
+    adc_oneshot_unit_handle_t adcUnitHandle = NULL;
     adc_oneshot_unit_init_cfg_t initConfig = {
         .unit_id = Unit, //ADC_UNIT_1
     };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&initConfig, &adcUnitHandle));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(adc_oneshot_new_unit(&initConfig, &adcUnitHandle));
     
     //ADC1 Config
     adc_oneshot_chan_cfg_t config = {
@@ -100,7 +98,7 @@ bool adcCalibrationInit(adc_unit_t Unit, adc_channel_t Channel, adc_atten_t Atte
         .atten = Attenuation,
     };
     
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adcUnitHandle, Channel, &config));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(adc_oneshot_config_channel(adcUnitHandle, Channel, &config));
     
     *adcHandle = adcUnitHandle;
 
@@ -151,10 +149,10 @@ uint32_t adcRead(adc_oneshot_unit_handle_t adcHandle, adc_channel_t Channel, boo
     int RawReading = 0;
     int Voltage = 0;
 
-    ESP_ERROR_CHECK(adc_oneshot_read(adcHandle, Channel, &RawReading));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(adc_oneshot_read(adcHandle, Channel, &RawReading));
     ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, Channel, RawReading);
     if (isCalibrated) {
-        ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adcCalibrationHandle, RawReading, &Voltage));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(adc_cali_raw_to_voltage(adcCalibrationHandle, RawReading, &Voltage));
         ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, Channel, Voltage);
     }
     return Voltage;
@@ -163,17 +161,17 @@ uint32_t adcRead(adc_oneshot_unit_handle_t adcHandle, adc_channel_t Channel, boo
 static void adcCalibrationDeinit(adc_cali_handle_t Handle) {
 #if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
     ESP_LOGI(TAG, "deregister %s calibration scheme", "Curve Fitting");
-    ESP_ERROR_CHECK(adc_cali_delete_scheme_curve_fitting(Handle));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(adc_cali_delete_scheme_curve_fitting(Handle));
 
 #elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
     ESP_LOGI(TAG, "deregister %s calibration scheme", "Line Fitting");
-    ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(Handle));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(adc_cali_delete_scheme_line_fitting(Handle));
 #endif //ADC_CALI_SCHEME
 }
 
 //isCalibrated is the return of the adcCalibrationInit function
 void adcDeinit(adc_oneshot_unit_handle_t adcHandle, bool isCalibrated, adc_cali_handle_t adcCalibrationHandle) {
-    ESP_ERROR_CHECK(adc_oneshot_del_unit(adcHandle));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(adc_oneshot_del_unit(adcHandle));
     if (isCalibrated) {
         adcCalibrationDeinit(adcCalibrationHandle);
     }
