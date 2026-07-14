@@ -1,12 +1,13 @@
 /*
  led_indicator — non-blocking single-LED status indicator (LEDC PWM)
- Version: 1.3.0  (updated 2026-06-28)
+ Version: 1.6.4  (updated 2026-07-15)
  Created by Aram Vartanyan, (C) 2026
  */
 
 #include "led_indicator.h"
 
 #include "driver/ledc.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "freertos/task.h"
@@ -16,15 +17,35 @@ static const char *TAG = "led_ind";
 
 /* ---- PWM resolution / continuous-effect tunables ---- */
 #define LED_PWM_RES        LEDC_TIMER_10_BIT
+/* Driver duty scale: the ESP32 LEDC takes timer-resolution units (0..1024 at
+   10 bits); the ESP8266 compatibility driver takes 0..8196 regardless of the
+   resolution — see README.md. */
+#ifdef CONFIG_IDF_TARGET_ESP8266
+#define LED_DRV_FULL       8196u
+#else
+#define LED_DRV_FULL       LED_MAX_DUTY
+#endif
 #define LED_MAX_DUTY       (1u << 10)               /* 1024 = true full scale (LEDC 100%) */
+#ifdef CONFIG_IDF_TARGET_ESP8266
+/* Proven-stable value on the ESP8266 software PWM (the led_dim reference runs
+   at 1 kHz). At 5 kHz the driver's period is only 1e6/5000 = 200 units — both
+   coarse and heavier on the PWM timer ISR. See README.md. */
+#define LED_DEFAULT_FREQ   1000
+#else
 #define LED_DEFAULT_FREQ   5000
+#endif
 #define DEFAULT_PERIOD_MS  60                       /* ledFlash period fallback */
 #define DEFAULT_BLINK_MS   500                      /* ledBlink period fallback */
 
 #define BREATHE_TICK_MS    25
-#define BREATHE_PERIOD_MS  2500
-#define BREATHE_STEPS      (BREATHE_PERIOD_MS / BREATHE_TICK_MS)  /* 100 */
-#define BREATHE_HALF       (BREATHE_STEPS / 2)                    /* 50  */
+#define BREATHE_PERIOD_MS  5000   /* full inhale+exhale; ~5 s reads as a calm, natural breath */
+#define BREATHE_STEPS      (BREATHE_PERIOD_MS / BREATHE_TICK_MS)  /* 200 */
+#define BREATHE_HALF       (BREATHE_STEPS / 2)                    /* 100 */
+/* Rest at the bottom of the breath (duty 0) once per cycle, so it reads like a
+   real breath: inhale, exhale, then a short pause before the next inhale. The
+   top needs no such dwell — the squared ramp is already flat there, so the LED
+   naturally lingers bright. Only the wrap tick (i==0) uses this longer period. */
+#define BREATHE_BOTTOM_HOLD_MS 400
 
 #define HEARTBEAT_ON_MS    80     /* "alive" pulse width */
 #define HEARTBEAT_OFF_MS   1920   /* gap; 80 + 1920 = 2 s period */
@@ -57,6 +78,7 @@ enum { PH_OPP = 0, PH_BASE = 1, PH_GAP = 2 };
 
 static LedConfig s_cfg;
 static uint32_t  s_on_duty = LED_MAX_DUTY;   /* duty for "on" (scaled by onPercent) */
+static uint32_t  s_last_drv = 0xFFFFFFFFu;   /* last duty written to the driver (skip repeats) */
 static bool      s_inited  = false;
 
 static TimerHandle_t     s_timer = NULL;
@@ -83,7 +105,22 @@ static void apply_duty(uint32_t logical)
     if (logical > LED_MAX_DUTY) {
         logical = LED_MAX_DUTY;
     }
+    if (s_cfg.gpioOnly) {
+        /* No PWM: any level past half-scale is "on". on/off, blink and flash
+           only ever pass 0 or full, so this is exact for them; breathing
+           collapses to a square wave (unused in this mode by design). */
+        bool on = logical > (LED_MAX_DUTY / 2);
+        gpio_set_level((gpio_num_t)s_cfg.gpio, (on != s_cfg.activeLow) ? 1 : 0);
+        return;
+    }
     uint32_t d = s_cfg.activeLow ? (LED_MAX_DUTY - logical) : logical; /* software polarity */
+    d = d * LED_DRV_FULL / LED_MAX_DUTY;                    /* engine scale -> driver scale */
+    if (d == s_last_drv) {
+        return;   /* duty unchanged -> skip the write. Re-queuing the same value can error
+                     the ESP8266 ledc fade queue (size 1) if its task has not drained the
+                     previous entry yet ("xQueueSend err"), and repeats nothing on any SDK. */
+    }
+    s_last_drv = d;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)s_cfg.ledcChannel, d);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)s_cfg.ledcChannel);
 }
@@ -163,7 +200,8 @@ static void led_timer_cb(TimerHandle_t t)
     } else if (s_bg == BG_BREATHE) {             /* continuous breathing step */
         s_breathe_i = (uint16_t)((s_breathe_i + 1) % BREATHE_STEPS);
         apply_duty(breathe_duty(s_breathe_i));
-        rearm(BREATHE_TICK_MS);
+        /* dwell at the very bottom (i==0, duty 0) — the rest between breaths */
+        rearm(s_breathe_i == 0 ? BREATHE_BOTTOM_HOLD_MS : BREATHE_TICK_MS);
     } else if (s_bg == BG_BLINK) {               /* continuous square blink step */
         s_blink_on = !s_blink_on;
         apply_duty(s_blink_on ? s_on_duty : 0);
@@ -206,34 +244,75 @@ esp_err_t ledInit(const LedConfig *cfg)
     if (s_cfg.onPercent == 0 || s_cfg.onPercent > 100) s_cfg.onPercent = 100;
     s_on_duty = (uint32_t)LED_MAX_DUTY * s_cfg.onPercent / 100;
 
-    ledc_timer_config_t tcfg = {
-        .speed_mode      = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LED_PWM_RES,
-        .timer_num       = (ledc_timer_t)s_cfg.ledcTimer,
-        .freq_hz         = s_cfg.freqHz,
-        .clk_cfg         = LEDC_AUTO_CLK,
-    };
-    esp_err_t err = ledc_timer_config(&tcfg);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "ledc_timer_config failed: %d", err); return err; }
+    if (s_cfg.gpioOnly) {
+        /* Plain GPIO output — no PWM timer/channel, hence no PWM ISR at all.
+           The state machine below (steady/blink/flash) drives it via the
+           FreeRTOS timer, which only runs while a pattern is active. */
+        gpio_config_t io = {
+            .pin_bit_mask = (1ULL << s_cfg.gpio),
+            .mode         = GPIO_MODE_OUTPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io);
+    } else {
+        ledc_timer_config_t tcfg = {
+            .speed_mode      = LEDC_LOW_SPEED_MODE,
+            .duty_resolution = LED_PWM_RES,
+            .timer_num       = (ledc_timer_t)s_cfg.ledcTimer,
+            .freq_hz         = s_cfg.freqHz,
+#ifndef CONFIG_IDF_TARGET_ESP8266
+            .clk_cfg         = LEDC_AUTO_CLK,   /* absent on ESP8266 — see README.md */
+#endif
+        };
+        esp_err_t err = ledc_timer_config(&tcfg);
+        if (err != ESP_OK) { ESP_LOGE(TAG, "ledc_timer_config failed: %d", err); return err; }
 
-    ledc_channel_config_t ccfg = {
-        .gpio_num   = s_cfg.gpio,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel    = (ledc_channel_t)s_cfg.ledcChannel,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .timer_sel  = (ledc_timer_t)s_cfg.ledcTimer,
-        .duty       = s_cfg.activeLow ? LED_MAX_DUTY : 0,   /* start OFF */
-        .hpoint     = 0,
-    };
-    err = ledc_channel_config(&ccfg);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "ledc_channel_config failed: %d", err); return err; }
+        ledc_channel_config_t ccfg = {
+            .gpio_num   = s_cfg.gpio,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel    = (ledc_channel_t)s_cfg.ledcChannel,
+            .intr_type  = LEDC_INTR_DISABLE,
+            .timer_sel  = (ledc_timer_t)s_cfg.ledcTimer,
+#ifdef CONFIG_IDF_TARGET_ESP8266
+            .duty       = 0,   /* validated against the period in us on the 8266 (see README.md);
+                                  the true OFF level is applied right below via apply_duty(0) */
+#else
+            .duty       = s_cfg.activeLow ? LED_MAX_DUTY : 0,   /* start OFF */
+#endif
+            .hpoint     = 0,
+        };
+        err = ledc_channel_config(&ccfg);
+        if (err != ESP_OK) { ESP_LOGE(TAG, "ledc_channel_config failed: %d", err); return err; }
 
-    s_timer = xTimerCreate("led", pdMS_TO_TICKS(BREATHE_TICK_MS), pdFALSE, NULL, led_timer_cb);
-    if (!s_timer) { ESP_LOGE(TAG, "alloc failed"); return ESP_ERR_NO_MEM; }
+#ifdef CONFIG_IDF_TARGET_ESP8266
+        /* On the ESP8266 this is what actually initialises the underlying PWM
+           driver (pwm_init) — mandatory before the first ledc_set_duty, which
+           otherwise dereferences the uninitialised pwm object. See README.md. */
+        err = ledc_fade_func_install(0);
+        if (err != ESP_OK) { ESP_LOGE(TAG, "ledc_fade_func_install failed: %d", err); return err; }
+        /* The ESP8266 ledc driver logs every duty change at INFO level
+           ("ledc: channel_num ... step_duty ..."), which floods the console
+           during breathing. Keep only its warnings and errors. */
+        esp_log_level_set("ledc", ESP_LOG_WARN);
+#endif
+    }
+
+    /* Safe to call ledInit more than once per boot (e.g. a boot-time OTA
+       indicator re-configured for the main application afterwards): reuse the
+       existing software timer, just stop any effect in progress. */
+    if (s_timer) {
+        xTimerStop(s_timer, 0);
+    } else {
+        s_timer = xTimerCreate("led", pdMS_TO_TICKS(BREATHE_TICK_MS), pdFALSE, NULL, led_timer_cb);
+        if (!s_timer) { ESP_LOGE(TAG, "alloc failed"); return ESP_ERR_NO_MEM; }
+    }
 
     s_base_on = false;
     s_bg = BG_STEADY;
     s_fx = FX_NONE;
+    s_last_drv = 0xFFFFFFFFu;             /* channel just (re)configured -> invalidate the cache */
     apply_duty(0);                       /* explicit OFF */
     s_inited = true;
     ESP_LOGI(TAG, "init gpio=%d activeLow=%d freq=%uHz v%s",

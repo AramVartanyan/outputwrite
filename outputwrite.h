@@ -1,7 +1,7 @@
 /*
  outputwrite — GPIO / Relay / ADC HAL helpers
  Version: 1.1.0  (updated 2026-06-22)
- Created by Aram Vartanyan, (C) 2024
+ Created by Aram Vartanyan, (C) 2026
  */
 
 #ifndef _OUTPUTWRITE_H_
