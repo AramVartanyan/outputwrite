@@ -6,7 +6,7 @@ Espressif chips. Created by Aram Vartanyan.
 | Module | Version | Purpose |
 |---|---|---|
 | `outputwrite.c/.h` | 1.1.0 | GPIO init (`ioInit`, `ioInitPdown`), input read, output write with software polarity (`OutputWrite`), ADC helpers |
-| `led_indicator.c/.h` | 1.6.4 | Non-blocking single-LED indicator engine (LEDC PWM): steady base, breathe, blink, heartbeat, transient flashes, fixed patterns (`ledOtaStatus`, `ledIdentify`, ...) |
+| `led_indicator.c/.h` | 1.7.0 | Non-blocking single-LED indicator: GPIO on/off by default, LEDC PWM only for breathing (on-demand); steady base, breathe, blink, heartbeat, transient flashes, fixed patterns (`ledOtaStatus`, `ledIdentify`, ...) |
 
 ## Platform support
 
@@ -75,32 +75,44 @@ Naming: this library's own functions use CamelCase (`ledInit`, `ledFlash`,
 Nothing is read from Kconfig inside the library: each project passes its
 own pins/options via `LedConfig`, so the module stays fully reusable.
 
-Persistent backgrounds (steady / breathe / blink / heartbeat) are mutually
-exclusive; transient effects (`ledFlash`, `ledFlashGroups`) overlay the
-steady base and are suppressed while a continuous background runs.
-`ledFlashBlocking` is for terminal paths (e.g. right before a factory
-reset), where the pattern must complete before the reset call.
+### Drive model
 
-### `gpioOnly` — zero-cost mode for a secondary status LED
-
-Set `LedConfig.gpioOnly = true` and the engine drives the pin with plain
-`gpio_set_level` instead of PWM. on/off, blink and flash behave identically
-(they only ever use full-on/full-off); only breathing and partial-brightness
-`ledSteady` collapse to on/off and should not be used in this mode.
+The LED is a plain **GPIO on/off** output by default. **LEDC PWM is used only
+for `ledBreathe()`** — spun up on demand when breathing starts and torn back
+down to GPIO (`ledc_stop` + pin reclaim) when it stops, so no PWM timer/ISR runs
+outside the breathe window. Every other indication (steady, flash, blink,
+heartbeat) is pure on/off.
 
 Why it matters, especially on the ESP8266: the SDK's software PWM is
-edge-scheduled — its timer ISR fires at every waveform edge, i.e. about
-twice per period *regardless of duty resolution*. So the number of steps
-(200, 1024, ...) does NOT change the CPU cost; only the frequency does
-(~2·freq_hz interrupts/second). Worse, the ISR reschedules itself every
-period even at a static 0 %/100 % level, so a solid or slowly-blinking LED
-still costs ~2·freq_hz interrupts/second for nothing. `gpioOnly` removes the
-PWM entirely: the pin is a bare GPIO, and the only remaining work is the
-FreeRTOS software timer that toggles it during an active blink/flash (a few
-callbacks per second, none while steady). For an accessory whose main job is
-elsewhere (a window-cover motor, a lock), this keeps the indicator off the
-CPU budget. Use full PWM mode only where real dimming/breathing is wanted
-(e.g. a lightbulb, where the LED is the primary function).
+edge-scheduled — its timer ISR fires ~twice per period *regardless of duty
+resolution*, and reschedules itself every period even at a static level. Keeping
+PWM to the breathe window alone means a solid or blinking indicator costs only
+the FreeRTOS software timer that toggles it (a few callbacks per second, none
+while steady) — the indicator stays off the CPU budget of an accessory whose
+main job is elsewhere (a window-cover motor, a lock).
+
+`LedConfig.gpioOnly = true` forbids PWM entirely: `ledBreathe()` then degrades to
+an on/off square wave instead of a smooth fade. Use it for a secondary indicator
+that never needs to breathe. (Real dimming across the whole range belongs in a
+lightbulb driver, not a status indicator.)
+
+### Engines
+
+Two internal engines; every public function is a thin wrapper over one of them:
+- `start_flash()` — finite, transient pattern (N blinks, optionally grouped with
+  a gap), then back to the background. Wrappers: `ledFlash`, `ledFlashGroups`,
+  `ledTxFlash`, `ledOverheated`, `ledResetNetwork`, `ledNotifyFlash`,
+  `ledIdentify`.
+- `start_cycle()` — continuous pattern until stopped. Wrappers: `ledBlink`
+  (full↔off, symmetric), `ledHeartbeat` (opposite-of-base pulse, 80/1920 ms),
+  `ledOtaStatus` (a slow blink).
+
+The persistent backgrounds — **steady**, **breathe**, **cycle** (blink/heartbeat)
+— are mutually exclusive. Transient flashes overlay the steady base only and are
+suppressed while a background runs. **While breathing, the library ignores
+flash/cycle calls** (breathing owns the LED). `ledFlashBlocking` (wrapped by
+`ledResetOk`) is the only blocking call — for terminal paths such as just before
+a factory reset, where the pattern must complete before the reset call.
 
 ## Typical usage (window-cover firmware)
 
@@ -115,6 +127,27 @@ ledFlashBlocking(3, 100);       // just before hap_reset_to_factory()
 
 ## Changelog
 
+- **led_indicator 1.7.0** (2026-07-15): internal rearchitecture — public API and
+  every blink pattern/timing unchanged. (1) **Drive model:** the LED is now plain
+  GPIO on/off by default; **LEDC PWM is used only for `ledBreathe`**, spun up on
+  demand and released back to GPIO (`ledc_stop` + pin reclaim) when breathing
+  stops — no PWM timer/ISR runs outside the breathe window. A new `pwm_active`
+  flag routes `apply_duty` (GPIO vs LEDC). (2) **Two engines, everything a thin
+  wrapper:** `start_flash` (finite/transient) and the new `start_cycle`
+  (continuous); `ledBlink`/`ledHeartbeat` are now wrappers of `start_cycle`, so
+  the `BG_BLINK`/`BG_HEARTBEAT` background modes collapse into a single
+  `BG_CYCLE`. `run_background()` is the single source of truth for "apply frame +
+  (re)arm". (3) **State** consolidated from ~17 scattered file-scope statics into
+  one `s` struct (enums right-sized to `uint8_t`). (4) **Constants:** the ~20
+  per-pattern `#define`s (all coincidental duplicates) are gone — literals inline
+  in the one-line wrappers; only the engine/computed constants remain. (5) **New
+  guarantee:** while breathing, `ledBlink`/`ledFlash`/… calls are ignored
+  (breathing owns the LED). (6) **Removed the unused `onPercent` `LedConfig`
+  field** — nobody dimmed the steady LED; the "on" level and breathe peak are now
+  always full scale. Projects that set `.onPercent` in their initializer must drop
+  that line (it becomes a compile error — loud, not silent). **Requires hardware
+  validation** — the ESP8266 LEDC teardown/re-init cycle is not yet bench-tested
+  (ESP32 is routine).
 - **led_indicator 1.6.4** (2026-07-15): `apply_duty` now skips the write when the
   driver duty is unchanged from the last one it pushed (`s_last_drv` cache). On
   the ESP8266 the `ledc` driver queues each duty update through a size-1 fade

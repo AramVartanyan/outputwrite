@@ -1,8 +1,8 @@
 /*
- led_indicator — non-blocking single-LED status indicator (LEDC PWM)
- Version: 1.6.4  (updated 2026-07-15)
+ led_indicator — non-blocking single-LED status indicator
+ Version: 1.7.0  (updated 2026-07-15)
  Created by Aram Vartanyan, (C) 2026
- */
+*/
 
 #ifndef _LED_INDICATOR_H_
 #define _LED_INDICATOR_H_
@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define LED_INDICATOR_VERSION "1.6.4"
+#define LED_INDICATOR_VERSION "1.7.0"
 
 /* Configuration passed at init. Nothing is read from Kconfig inside the
    library — each project supplies its own pins/options, so the module stays
@@ -24,7 +24,6 @@ typedef struct {
     int      gpio;          /* LED GPIO number */
     bool     activeLow;     /* true: LED lights on LOW level (software inverted) */
     uint32_t freqHz;        /* PWM frequency; 0 -> 5000 Hz */
-    uint8_t  onPercent;     /* steady "on" brightness 1..100; 0 -> 100 */
     uint8_t  ledcTimer;     /* LEDC timer index (0..3) */
     uint8_t  ledcChannel;   /* LEDC channel index */
     bool     gpioOnly;      /* true: drive the pin with plain GPIO (no PWM) —
@@ -45,7 +44,9 @@ void ledSteady(bool on);
 
 /* Continuous breathing (smooth fade with a short rest at the dark bottom of
    each cycle), e.g. while the commissioning window is open. on=false returns to
-   the steady base level. */
+   the steady base level. While breathing, blink/flash calls are ignored
+   (breathing owns the LED). Requires a non-gpioOnly config for the fade; a
+   gpioOnly LED degrades to an on/off square wave. */
 void ledBreathe(bool on);
 
 /* Continuous square on/off blink at `periodMs` half-period, until turned off
